@@ -1,8 +1,8 @@
 {
   "name": "dsh-session-delete",
-  "description": "会话删除：在会话头部右侧添加红色垃圾桶按钮（悬停显现），二次确认后删除（归档隐藏）当前会话。",
-  "version": "1.0.0",
-  "private": true,
+  "description": "会话删除：在侧栏会话行的「⋯」菜单里加一行「删除会话…」，可归档隐藏，也可连同投影缓存移入回收站（可还原、可彻底清空）。 · Delete a session from the sidebar row's \"…\" menu: archive it, or move it to a trash you can restore from.",
+  "version": "1.1.0",
+  "license": "MIT",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -10,16 +10,22 @@
     "./client": "./lib/client.js",
     "./package.json": "./package.json"
   },
+  "files": [
+    "lib",
+    "tools",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
     "client": {
       "inject": [
-        "@deepseek-ai/dsh-client-runtime",
         "@deepseek-ai/dsh-client-locale",
-        "@deepseek-ai/dsh-client-ui-slots",
-        "@deepseek-ai/dsh-client-ui-conversation"
+        "@deepseek-ai/dsh-client-ui-settings",
+        "@deepseek-ai/dsh-client-ui-workspace"
       ],
       "platform": "web"
     }
