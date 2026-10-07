@@ -1,7 +1,7 @@
 {
   "name": "dsh-session-delete",
-  "description": "会话删除：在侧栏会话行的「⋯」菜单里加一行「删除会话…」，可归档隐藏，也可连同投影缓存移入回收站（可还原、可彻底清空）。 · Delete a session from the sidebar row's \"…\" menu: archive it, or move it to a trash you can restore from.",
-  "version": "1.1.0",
+  "description": "会话删除：在侧栏会话行的「⋯」菜单里加一行「删除会话…」，把该会话的日志与投影缓存移到操作系统自己的回收站，并从工作区列表摘掉。 · Delete a session from the sidebar row's \"…\" menu: its log and projection cache go to the operating system's recycle bin, and the row leaves the list.",
+  "version": "1.2.0",
   "license": "MIT",
   "type": "module",
   "main": "lib/index.js",

@@ -30,8 +30,10 @@
  *    `apply()` on a fake context, and asserts the three registrations, the
  *    dictionary parity, and that the menu row renders nothing without a
  *    Session id and an element with one.
- * 6. Host half        — against a fake Harness home: trash / list / restore /
- *    purge, plus every refusal that protects the rest of the disk.
+ * 6. Host half        — against a fake Harness home: locate / delete / rollback
+ *    on a refused recycle, plus every refusal that protects the rest of the
+ *    disk. The recycler is injectable precisely so a dry run never puts
+ *    anything in the user's recycle bin.
  * 7. Isolation        — the real home is untouched, and uninstalling the staged
  *    copy leaves no residue.
  *
@@ -44,10 +46,10 @@
  * live: the slot occupant list shows whether the gate actually let the entry in.
  */
 
-import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, readdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
-import { dirname, join, resolve, sep } from 'node:path'
+import { basename, dirname, join, resolve, sep } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import vm from 'node:vm'
 
@@ -126,12 +128,27 @@ async function main() {
     process.exit(2)
   }
 
-  const realTrashBefore = existsSync(join(realHome, 'trash', NAME))
   // Snapshot rather than assume: this plugin IS installed on some machines, so
   // the isolation property is "the run changed nothing", not "the profile does
   // not mention it".
   const realProfilePath = join(realHome, 'profiles', 'desktop', 'package.json')
   const realProfileBefore = existsSync(realProfilePath) ? await readFile(realProfilePath, 'utf8') : null
+  // The delete path moves whole Session directories, so the real Session log
+  // tree is snapshotted too: a dry run that touched it would be the worst kind
+  // of passing test.
+  const realSessionsRoot = join(realHome, 'sessions')
+  const listRealSessions = async () => {
+    const out = []
+    if (!existsSync(realSessionsRoot)) return out
+    for (const project of await readdir(realSessionsRoot, { withFileTypes: true })) {
+      if (!project.isDirectory()) continue
+      for (const session of await readdir(join(realSessionsRoot, project.name), { withFileTypes: true })) {
+        if (session.isDirectory()) out.push(`${project.name}/${session.name}`)
+      }
+    }
+    return out.sort()
+  }
+  const realSessionsBefore = await listRealSessions()
   await rm(scratch, { recursive: true, force: true })
   await mkdir(scratch, { recursive: true })
 
@@ -224,7 +241,7 @@ async function main() {
   const loaderEntries = {}
 
   // HTTP seam: the client half reaches its Host half with fetch, so recording
-  // those calls is how the ordered trash flow gets asserted. `responder` is
+  // those calls is how the ordered delete flow gets asserted. `responder` is
   // swapped per case.
   const rpcCalls = []
   let responder = () => ({ status: 200, body: '{}' })
@@ -273,9 +290,11 @@ async function main() {
       throw new Error(`this half must not require ${specifier}`)
     })
     check(typeof client.apply === 'function', 'client half exports apply()')
+    // The client half no longer touches `workspaces`: the Host half owns the
+    // registry work now that the whole delete is one request.
     check(
-      JSON.stringify(client.inject) === JSON.stringify(['slots', 'locale', 'workspaces']),
-      'cordis inject is slots/locale/workspaces',
+      JSON.stringify(client.inject) === JSON.stringify(['slots', 'locale']),
+      'cordis inject is slots/locale',
       JSON.stringify(client.inject),
     )
 
@@ -290,7 +309,6 @@ async function main() {
         inject: (slot, callback) => { injections.push(slot); callback(); return () => {} },
         register: (meta, component) => { registrations.push({ meta, component }); return () => {} },
       },
-      workspaces: { archiveSession: async () => {}, unarchiveSession: async () => {} },
     }
     try {
       client.apply(ctx)
@@ -309,12 +327,13 @@ async function main() {
       'zh/en dictionaries have identical key sets',
       `${zhKeys.length} keys`,
     )
-    for (const slot of ['sidebar.workspaces.session.menu.item', 'shell.overlay', 'settings.section']) {
+    for (const slot of ['sidebar.workspaces.session.menu.item', 'shell.overlay']) {
       check(injections.includes(slot), `waits for the ${slot} slot`)
     }
+    check(injections.includes('settings.section') === false, 'no settings page is registered any more')
 
     const bySlot = Object.fromEntries(registrations.map(({ meta, component }) => [meta.name, { meta, component }]))
-    check(registrations.length === 3, 'registers exactly three slots', String(registrations.length))
+    check(registrations.length === 2, 'registers exactly two slots', String(registrations.length))
     const menu = bySlot['sidebar.workspaces.session.menu.item']
     check(menu !== undefined && menu.meta.id === NAME, 'menu row uses the package-namespaced id', menu?.meta.id)
     check(menu !== undefined && menu.meta.order === 500, 'menu row sits after the shipped rows', String(menu?.meta.order))
@@ -343,17 +362,12 @@ async function main() {
         throw new Error(`unexpected require: ${specifier}`)
       })
       const officialRegistrations = []
-      const officialArchived = []
       const officialCtx = {
         effect: (callback) => ({ dispose: callback() }),
         locale: { register: () => () => {}, bind: () => (key) => key, getSnapshot: () => ({ active: 'en' }) },
         slots: {
           inject: (slot, callback) => { callback(); return () => {} },
           register: (meta, component) => { officialRegistrations.push({ meta, component }); return () => {} },
-        },
-        workspaces: {
-          archiveSession: async (id) => { officialArchived.push(id) },
-          unarchiveSession: async () => {},
         },
       }
       official.apply(officialCtx)
@@ -377,18 +391,17 @@ async function main() {
         check(menuCloses.length === 1 && menuCloses[0] === false, 'selecting the row dismisses the menu')
       }
 
-      // The ordered trash flow, driven through the module's test seam: it takes
+      // The ordered delete flow, driven through the module's test seam: it takes
       // its UI callbacks as plain functions, so the sequence is assertable
       // without a React renderer — the only way to test it offline at all.
       const internal = official.__internal
-      check(internal !== undefined && typeof internal.trashWhileVisible === 'function', 'client exposes the trash flow as a test seam')
-      if (internal !== undefined && typeof internal.trashWhileVisible === 'function') {
+      check(internal !== undefined && typeof internal.deleteSessionFlow === 'function', 'client exposes the delete flow as a test seam')
+      if (internal !== undefined && typeof internal.deleteSessionFlow === 'function') {
         const drive = async (answer) => {
           rpcCalls.length = 0
-          officialArchived.length = 0
           const ui = { busy: [], error: [], done: [] }
           responder = (call) => answer(call)
-          await internal.trashWhileVisible('session-abc', {
+          await internal.deleteSessionFlow('session-abc', {
             busy: (value) => ui.busy.push(value),
             error: (value) => { if (value !== null) ui.error.push(value) },
             done: (value) => { if (value !== null) ui.done.push(value) },
@@ -396,30 +409,31 @@ async function main() {
           return ui
         }
         const paths = () => rpcCalls.map((call) => call.url).join(' ')
-        const probe = (status) => (call) => (call.url.endsWith('/trash/locate')
-          ? { status, body: status === 404 ? '{"ok":false,"reason":"not-found"}' : '{}' }
-          : { status: 200, body: '{"ok":true,"entry":"2026-01-01T00-00-00-000Z--session-abc"}' })
+        const probe = (status, answer) => (call) => (call.url.endsWith('/locate')
+          ? { status, body: status === 404 ? '{"ok":false,"reason":"not-found"}' : '{"ok":true}' }
+          : answer)
 
-        const happy = await drive(probe(200))
+        const happy = await drive(probe(200, { status: 200, body: '{"ok":true,"sessionId":"session-abc","recycled":[],"notes":[]}' }))
         check(
-          paths() === '/dsh-session-delete/trash/locate /dsh-session-delete/trash',
-          'the flow probes the Host before it moves anything',
+          paths() === '/dsh-session-delete/locate /dsh-session-delete/delete',
+          'the flow probes the Host before it deletes anything',
           paths(),
         )
-        check(officialArchived.join(' ') === 'session-abc', 'the flow archives the Session', officialArchived.join(' '))
         check(happy.done.length === 1 && happy.error.length === 0, 'the happy path reports success')
-        check(JSON.parse(rpcCalls[1].body).sessionId === 'session-abc', 'the move carries the session id')
+        check(JSON.parse(rpcCalls[1].body).sessionId === 'session-abc', 'the delete carries the session id')
 
-        const missing = await drive(probe(404))
-        check(officialArchived.length === 0, 'a Session the Host cannot find is NOT archived — the dead end 1.1.0 shipped')
-        check(rpcCalls.length === 1, 'a missing Session stops right after the probe', String(rpcCalls.length))
-        check(missing.error.length === 1 && missing.done.length === 0, 'a missing Session says why, and stays listed')
+        const missing = await drive(probe(404, { status: 200, body: '{"ok":true}' }))
+        check(rpcCalls.length === 1, 'a Session the Host cannot find stops right after the probe', String(rpcCalls.length))
+        check(missing.error.length === 1 && missing.done.length === 0, 'a missing Session says why, and nothing was deleted')
 
-        const oldHost = await drive((call) => (call.url.endsWith('/trash/locate')
-          ? { status: 405, body: '' }
-          : { status: 404, body: '{"ok":false,"reason":"not-found"}' }))
-        check(officialArchived.join(' ') === 'session-abc', 'a Host without the locator still archives — never worse than before')
-        check(oldHost.error.length === 1, 'a Host without the locator reports the move failure')
+        const partial = await drive(probe(200, { status: 200, body: '{"ok":true,"notes":["detach failed: boom"]}' }))
+        check(partial.error.length === 1, 'a registry note the Host calls a failure is surfaced', partial.error.join(' | '))
+
+        const oldHost = await drive(probe(405, { status: 200, body: '{"ok":true,"notes":[]}' }))
+        check(oldHost.done.length === 1, 'a Host without the locator still proceeds — never worse than before')
+
+        const unsupported = await drive(probe(200, { status: 501, body: '{"error":"no recycle bin","reason":"unsupported-platform"}' }))
+        check(unsupported.error.length === 1 && unsupported.done.length === 0, 'an unsupported platform is reported as such')
       }
     }
   }
@@ -445,32 +459,75 @@ async function main() {
   await writeFile(join(sessionDir, 'session.v4.jsonl.zstd'), 'log-bytes', 'utf8')
   await writeFile(join(keepDir, 'session.v4.jsonl.zstd'), 'other-log', 'utf8')
   await writeFile(projcache, '{"projection":true}', 'utf8')
-  await writeFile(join(home, 'storages', 'workspace.json'), '{"unit":{"name":"workspace","version":2}}', 'utf8')
 
   process.env.DSH_HOME = home
-  const routes = new Map()
+
+  // apply() must mount through the carrier and inside an effect.
+  const applied = new Map()
   let effects = 0
-  const hostCtx = {
+  const applyCtx = {
     webServer: {
       register: (route) => {
-        routes.set(route.path, route.handler)
-        return () => routes.delete(route.path)
+        applied.set(route.path, route.handler)
+        return () => applied.delete(route.path)
       },
     },
     get: () => undefined,
-    inject: (names, callback) => { callback(hostCtx); return () => {} },
+    inject: (names, callback) => { callback(applyCtx); return () => {} },
     effect: (callback) => { effects += 1; callback(); return () => {} },
   }
   try {
-    hostHalf.apply(hostCtx)
+    hostHalf.apply(applyCtx)
     pass('host half mounts against a fake Host context')
   } catch (error) {
     fail('host half mounts', String(error?.message ?? error))
   }
   check(effects === 1, 'routes mount inside a ctx.effect (unloadable)')
-  for (const path of ['/dsh-session-delete/trash', '/dsh-session-delete/trash/locate', '/dsh-session-delete/trash/restore', '/dsh-session-delete/trash/purge']) {
-    check(routes.has(path), `${path} registered`)
+  for (const path of ['/dsh-session-delete/locate', '/dsh-session-delete/delete']) {
+    check(applied.has(path), `${path} registered`)
   }
+
+  // A second table whose recycler is injectable. The real one hands bytes to
+  // the OS bin; this stand-in MOVES them somewhere else instead, because a dry
+  // run must never put anything in the user's recycle bin.
+  const routes = new Map()
+  const recycledTo = join(scratch, 'fake-recycle-bin')
+  const recycledPaths = []
+  const fakeRecycle = async (paths) => {
+    await mkdir(recycledTo, { recursive: true })
+    for (const target of paths) {
+      const destination = join(recycledTo, `${String(Date.now())}-${basename(target)}`)
+      await rename(target, destination)
+      recycledPaths.push(destination)
+    }
+    return { ok: true, recycled: paths }
+  }
+  const refusingRecycle = async () => ({ ok: false, reason: 'recycle-failed', message: 'refused by the stand-in' })
+  const registryCalls = []
+  const registry = {
+    list: () => [{
+      id: 'ws-1',
+      title: '插件',
+      sessionIds: [sessionId],
+      detachSession: async (id) => { registryCalls.push(`detach:${id}`) },
+    }],
+    archiveSession: async (id, options) => { registryCalls.push(`archive:${id}:stopActivity=${String(options?.stopActivity === true)}`) },
+    unarchiveSession: async (id) => { registryCalls.push(`unarchive:${id}`) },
+  }
+  const mountWith = (recycle) => {
+    const table = new Map()
+    hostHalf.__test__.mountRoutes({
+      webServer: {
+        register: (route) => {
+          table.set(route.path, route.handler)
+          return () => {}
+        },
+      },
+      get: (name) => (name === 'workspaceRegistry' ? registry : undefined),
+    }, { recycle })
+    return table
+  }
+  for (const [path, handler] of mountWith(fakeRecycle)) routes.set(path, handler)
 
   const call = async (path, options = {}) => {
     const handler = routes.get(path)
@@ -481,91 +538,76 @@ async function main() {
   }
   const sameOrigin = { origin: 'http://127.0.0.1:19387' }
 
-  // The read-only locator proves an install can SEE a Session without moving
-  // it — the one failure the UI cannot explain by itself, and the regression
-  // test for the double-`session-` lookup the first release shipped.
-  const located = await call('/dsh-session-delete/trash/locate', { method: 'POST', body: { sessionId }, headers: sameOrigin })
+  // The read-only locator proves an install can SEE a Session without moving it
+  // — the one failure the UI cannot explain by itself, and the regression test
+  // for the double-`session-` lookup an earlier release shipped.
+  const located = await call('/dsh-session-delete/locate', { method: 'POST', body: { sessionId }, headers: sameOrigin })
   check(located.record.status === 200 && located.json()?.dir === sessionDir, 'locate finds the canonical session id', JSON.stringify(located.json()))
-  const locatedBare = await call('/dsh-session-delete/trash/locate', { method: 'POST', body: { sessionId: bareSessionId }, headers: sameOrigin })
+  check(located.json()?.projectionCache === true, 'locate reports the projection cache too')
+  const locatedBare = await call('/dsh-session-delete/locate', { method: 'POST', body: { sessionId: bareSessionId }, headers: sameOrigin })
   check(locatedBare.record.status === 200 && locatedBare.json()?.dir === sessionDir, 'locate accepts a bare uuid for the same Session')
-  const locatedMissing = await call('/dsh-session-delete/trash/locate', { method: 'POST', body: { sessionId: 'session-00000000-0000-4000-8000-000000000000' }, headers: sameOrigin })
+  const locatedMissing = await call('/dsh-session-delete/locate', { method: 'POST', body: { sessionId: 'session-00000000-0000-4000-8000-000000000000' }, headers: sameOrigin })
   check(locatedMissing.record.status === 404, 'locate reports a Session it cannot find', `HTTP ${locatedMissing.record.status}`)
   check(existsSync(join(sessionDir, 'session.v4.jsonl.zstd')), 'locate moves nothing')
 
-  const empty = await call('/dsh-session-delete/trash')
-  check(
-    empty.record.status === 200 && Array.isArray(empty.json()?.entries) && empty.json().entries.length === 0,
-    'GET /trash starts empty',
-  )
-  check(empty.json()?.root?.startsWith(home) === true, 'trash root resolves inside the fake home', empty.json()?.root)
-
-  const traversal = await call('/dsh-session-delete/trash', { method: 'POST', body: { sessionId: '../../etc/passwd' } })
+  const traversal = await call('/dsh-session-delete/delete', { method: 'POST', body: { sessionId: '../../etc/passwd' } })
   check(traversal.record.status === 400, 'traversal-shaped session id refused', `HTTP ${traversal.record.status}`)
 
-  const crossOrigin = await call('/dsh-session-delete/trash', {
+  const crossOrigin = await call('/dsh-session-delete/delete', {
     method: 'POST',
     body: { sessionId },
     headers: { origin: 'http://evil.example', host: '127.0.0.1:19387' },
   })
   check(crossOrigin.record.status === 403, 'cross-origin request refused', `HTTP ${crossOrigin.record.status}`)
 
-  const trashed = await call('/dsh-session-delete/trash', { method: 'POST', body: { sessionId }, headers: sameOrigin })
-  const trashBody = trashed.json()
-  check(trashed.record.status === 200 && trashBody?.ok === true, 'session moves to the trash', JSON.stringify(trashBody))
-  const entryName = String(trashBody?.entry)
-  check(existsSync(sessionDir) === false, 'session directory left its old home')
-  check(existsSync(projcache) === false, 'projection cache left its old home')
-  check(existsSync(keepDir) === true, 'an unrelated session is untouched')
-  const entryDir = join(home, 'trash', NAME, entryName)
-  check(existsSync(join(entryDir, sessionId, 'session.v4.jsonl.zstd')), 'payload sits inside the trash entry')
-  check(existsSync(join(entryDir, 'session_projcache.json')), 'projection cache travelled with it')
-  check(existsSync(join(entryDir, 'trash.json')), 'entry records where it came from')
-  const meta = JSON.parse(await readFile(join(entryDir, 'trash.json'), 'utf8'))
-  check(meta.origin === sessionDir, 'origin recorded for a true restore', meta.origin)
-
-  const listed = await call('/dsh-session-delete/trash')
-  check(listed.json()?.entries?.length === 1, 'GET /trash lists the entry', String(listed.json()?.entries?.length))
-
-  const noConfirm = await call('/dsh-session-delete/trash/purge', { method: 'POST', body: { entry: entryName } })
-  check(noConfirm.record.status === 400, 'purge without confirmation refused', `HTTP ${noConfirm.record.status}`)
-
-  const restored = await call('/dsh-session-delete/trash/restore', { method: 'POST', body: { entry: entryName } })
-  check(restored.record.status === 200 && restored.json()?.ok === true, 'restore succeeds', JSON.stringify(restored.json()))
-  check(existsSync(join(sessionDir, 'session.v4.jsonl.zstd')), 'session directory is back where it was')
-  check(existsSync(projcache), 'projection cache is back where it was')
-  check(existsSync(entryDir) === false, 'a restored entry leaves no residue')
-
-  const again = await call('/dsh-session-delete/trash', { method: 'POST', body: { sessionId } })
-  const againEntry = String(again.json()?.entry)
-  const purged = await call('/dsh-session-delete/trash/purge', {
-    method: 'POST',
-    body: { confirm: true, entry: againEntry },
-  })
-  check(purged.record.status === 200 && purged.json()?.removed === 1, 'purge removes one entry', JSON.stringify(purged.json()))
-  check(existsSync(join(home, 'trash', NAME, againEntry)) === false, 'purged bytes are gone')
-  check(existsSync(sessionDir) === false, 'a purged session does not come back')
-
-  const unsafeEntry = await call('/dsh-session-delete/trash/purge', {
-    method: 'POST',
-    body: { confirm: true, entry: '..\\..\\windows' },
-  })
-  check(unsafeEntry.record.status === 400, 'traversal-shaped entry refused', `HTTP ${unsafeEntry.record.status}`)
-
-  // A well-formed id that has no directory: valid shape, nothing to move.
-  const absent = await call('/dsh-session-delete/trash', {
-    method: 'POST',
-    body: { sessionId: '00000000-0000-4000-8000-000000000000' },
-  })
-  check(absent.record.status === 404, 'unknown session reported as 404', `HTTP ${absent.record.status}`)
-  check(existsSync(keepDir) === true, 'the unrelated session is still untouched')
-
-  const wrongMethod = await call('/dsh-session-delete/trash/purge', { method: 'GET' })
+  const wrongMethod = await call('/dsh-session-delete/delete', { method: 'GET' })
   check(wrongMethod.record.status === 405, 'wrong method answered 405', `HTTP ${wrongMethod.record.status}`)
+
+  // A refused recycle leaves EVERYTHING as it was: the log in place, the archive
+  // from the stop step undone, and nothing detached. That is the difference
+  // between a failure and a half-state.
+  registryCalls.length = 0
+  for (const [path, handler] of mountWith(refusingRecycle)) routes.set(path, handler)
+  const refused = await call('/dsh-session-delete/delete', { method: 'POST', body: { sessionId }, headers: sameOrigin })
+  check(refused.record.status === 500, 'a refused recycle is a failure, not a silent unlink', `HTTP ${refused.record.status}`)
+  check(registryCalls.includes(`archive:${sessionId}:stopActivity=true`), 'the Session is stopped before the move', registryCalls.join(' '))
+  check(registryCalls.includes(`unarchive:${sessionId}`), 'a failed move undoes the stop archive', registryCalls.join(' '))
+  check(registryCalls.some((entry) => entry.startsWith('detach:')) === false, 'a failed move detaches nothing')
+  check(existsSync(join(sessionDir, 'session.v4.jsonl.zstd')), 'a failed move leaves the log where it was')
+  check(existsSync(projcache), 'a failed move leaves the projection cache where it was')
+
+  registryCalls.length = 0
+  recycledPaths.length = 0
+  for (const [path, handler] of mountWith(fakeRecycle)) routes.set(path, handler)
+  const deleted = await call('/dsh-session-delete/delete', { method: 'POST', body: { sessionId }, headers: sameOrigin })
+  check(deleted.record.status === 200 && deleted.json()?.ok === true, 'delete succeeds', JSON.stringify(deleted.json()))
+  check(existsSync(sessionDir) === false, 'the log directory left its old home')
+  check(existsSync(projcache) === false, 'the projection cache left its old home')
+  check(existsSync(keepDir) === true, 'an unrelated session is untouched')
+  check(recycledPaths.length === 2, 'both files were handed to the recycler', String(recycledPaths.length))
+  check(recycledPaths.every((target) => existsSync(target)), 'the recycled bytes still exist — a recycle is not an unlink')
+  check(registryCalls.includes(`archive:${sessionId}:stopActivity=true`), 'the sequence stops the Session first', registryCalls.join(' '))
+  check(registryCalls.includes(`detach:${sessionId}`), 'the sequence detaches it from the workspace', registryCalls.join(' '))
+  check(registryCalls.includes(`unarchive:${sessionId}`), 'the sequence clears the archive entry it made', registryCalls.join(' '))
+  check(
+    registryCalls.indexOf(`archive:${sessionId}:stopActivity=true`) < registryCalls.indexOf(`detach:${sessionId}`),
+    'the order is stop, recycle, detach',
+    registryCalls.join(' '),
+  )
+
+  const second = await call('/dsh-session-delete/delete', { method: 'POST', body: { sessionId }, headers: sameOrigin })
+  check(second.record.status === 404, 'deleting an already-deleted Session is a 404, not a crash', `HTTP ${second.record.status}`)
+  check(existsSync(keepDir) === true, 'the unrelated session is still untouched')
 
   /* ---------------------------- 7. isolation ---------------------------- */
   console.log('\n[7] isolation and uninstall')
   check(resolve(process.env.DSH_HOME) === home, 'the run used the scratch home')
-  check(existsSync(join(realHome, 'trash', NAME)) === realTrashBefore, 'the real trash directory was not created')
+  const realSessionsAfter = await listRealSessions()
+  check(
+    JSON.stringify(realSessionsAfter) === JSON.stringify(realSessionsBefore),
+    'every real Session log is exactly where it was',
+    `${realSessionsAfter.length} sessions`,
+  )
   const realProfileAfter = existsSync(realProfilePath) ? await readFile(realProfilePath, 'utf8') : null
   check(realProfileAfter === realProfileBefore, 'the real desktop profile manifest is untouched by the run')
 
