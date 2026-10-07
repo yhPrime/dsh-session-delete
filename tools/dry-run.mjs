@@ -298,10 +298,13 @@ async function main() {
       JSON.stringify(client.inject),
     )
 
-    // The dialog's end-state button is wired to a page reload. Rendering the
-    // dialog needs hooks this lane does not fake, so the wiring is asserted at
-    // the source level — enough to catch its accidental removal.
-    check(clientSource.indexOf('location.reload') !== -1, 'the acknowledgement is wired to a page reload')
+    // MEASURED, not assumed: reloading the page does NOT clear the row a
+    // deleted-but-still-loaded Session leaves behind — that row lives in the
+    // HOST's in-memory session store — so the acknowledgement must not reload.
+    // Rendering the dialog needs hooks this lane does not fake, so the wiring is
+    // asserted at the source level, which is enough to catch its return.
+    check(clientSource.indexOf('location.reload') === -1, 'the acknowledgement does not reload the page')
+    check(clientSource.indexOf('liveNotice') !== -1, 'a lingering row is announced as a notice')
 
     const ctx = {
       effect: (callback) => ({ dispose: callback() }),
@@ -429,13 +432,9 @@ async function main() {
         )
 
         const wasLive = await drive(answer(200, '{"ok":true,"wasLive":true,"notes":[]}'))
-        check(
-          wasLive.done.length === 1 && String(wasLive.done[0]).indexOf('reload') !== -1,
-          'a Session this run had loaded is told its row may linger, and that a reload is the way out',
-          String(wasLive.done[0]),
-        )
-        check(wasLive.done[0] !== happy.done[0], 'the live case does not reuse the plain success text')
-        check(wasLive.live.length === 1 && wasLive.live[0] === true, 'the flow tells the UI a row is expected to linger')
+        check(wasLive.done.length === 1, 'the live case still reports success')
+        check(wasLive.done[0] === happy.done[0], 'the success text is the same; only the notice differs')
+        check(wasLive.live.length === 1 && wasLive.live[0] === true, 'the flow tells the UI a row will linger')
         check(happy.live.length === 0, 'the plain path reports no lingering row')
 
         const partial = await drive(answer(200, '{"ok":true,"notes":["detach failed: boom"]}'))
