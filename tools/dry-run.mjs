@@ -409,30 +409,26 @@ async function main() {
           return ui
         }
         const paths = () => rpcCalls.map((call) => call.url).join(' ')
-        const probe = (status, answer) => (call) => (call.url.endsWith('/locate')
-          ? { status, body: status === 404 ? '{"ok":false,"reason":"not-found"}' : '{"ok":true}' }
-          : answer)
+        const answer = (status, body) => () => ({ status, body })
 
-        const happy = await drive(probe(200, { status: 200, body: '{"ok":true,"sessionId":"session-abc","recycled":[],"notes":[]}' }))
-        check(
-          paths() === '/dsh-session-delete/locate /dsh-session-delete/delete',
-          'the flow probes the Host before it deletes anything',
-          paths(),
-        )
+        const happy = await drive(answer(200, '{"ok":true,"sessionId":"session-abc","recycled":[],"notes":[]}'))
+        check(paths() === '/dsh-session-delete/delete', 'the flow makes ONE request — the Host owns the order', paths())
         check(happy.done.length === 1 && happy.error.length === 0, 'the happy path reports success')
-        check(JSON.parse(rpcCalls[1].body).sessionId === 'session-abc', 'the delete carries the session id')
+        check(JSON.parse(rpcCalls[0].body).sessionId === 'session-abc', 'the delete carries the session id')
 
-        const missing = await drive(probe(404, { status: 200, body: '{"ok":true}' }))
-        check(rpcCalls.length === 1, 'a Session the Host cannot find stops right after the probe', String(rpcCalls.length))
-        check(missing.error.length === 1 && missing.done.length === 0, 'a missing Session says why, and nothing was deleted')
+        const removedOnly = await drive(answer(200, '{"ok":true,"removedOnly":true,"notes":["the registry did not report this row"]}'))
+        check(
+          removedOnly.done.length === 1 && removedOnly.error.length === 0,
+          'a row with no log left is removed, and reported as such',
+        )
 
-        const partial = await drive(probe(200, { status: 200, body: '{"ok":true,"notes":["detach failed: boom"]}' }))
+        const partial = await drive(answer(200, '{"ok":true,"notes":["detach failed: boom"]}'))
         check(partial.error.length === 1, 'a registry note the Host calls a failure is surfaced', partial.error.join(' | '))
 
-        const oldHost = await drive(probe(405, { status: 200, body: '{"ok":true,"notes":[]}' }))
-        check(oldHost.done.length === 1, 'a Host without the locator still proceeds — never worse than before')
+        const unknown = await drive(answer(404, '{"error":"no log directory"}'))
+        check(unknown.error.length === 1 && unknown.done.length === 0, 'an id the Host cannot place is reported, not glossed over')
 
-        const unsupported = await drive(probe(200, { status: 501, body: '{"error":"no recycle bin","reason":"unsupported-platform"}' }))
+        const unsupported = await drive(answer(501, '{"error":"no recycle bin","reason":"unsupported-platform"}'))
         check(unsupported.error.length === 1 && unsupported.done.length === 0, 'an unsupported platform is reported as such')
       }
     }
@@ -503,13 +499,43 @@ async function main() {
     return { ok: true, recycled: paths }
   }
   const refusingRecycle = async () => ({ ok: false, reason: 'recycle-failed', message: 'refused by the stand-in' })
+  // The registry's own durable file decides what counts as a row this Host
+  // knows about — which is what makes a row whose log is already gone
+  // removable instead of permanently stuck.
+  const zombieId = 'session-00000000-0000-4000-8000-0000000000ff'
+  const workspaceFile = join(home, 'storages', 'workspace.json')
+  await mkdir(dirname(workspaceFile), { recursive: true })
+  await writeFile(workspaceFile, JSON.stringify({
+    unit: { name: 'workspace', version: 2 },
+    global: { initialized: true, workspaceIds: ['ws-1'], archivedSessionIds: [zombieId], pinnedSessionIds: [] },
+    tables: {
+      workspaces: {
+        'ws-1': { path: 'E:\\demo', title: '插件', sessionIds: [sessionId, zombieId, keepId] },
+      },
+    },
+  }, null, 2), 'utf8')
+
   const registryCalls = []
   const registry = {
     list: () => [{
       id: 'ws-1',
       title: '插件',
-      sessionIds: [sessionId],
-      detachSession: async (id) => { registryCalls.push(`detach:${id}`) },
+      sessionIds: [sessionId, zombieId],
+      detachSession: async (id) => {
+        registryCalls.push(`detach:${id}`)
+        // Detaching is durable on a real host, so the fixture follows: a second
+        // delete then has nothing left to find, exactly as in production.
+        const document = JSON.parse(await readFile(workspaceFile, 'utf8'))
+        for (const workspace of Object.values(document.tables?.workspaces ?? {})) {
+          if (Array.isArray(workspace.sessionIds)) {
+            workspace.sessionIds = workspace.sessionIds.filter((entry) => entry !== id)
+          }
+        }
+        if (Array.isArray(document.global?.archivedSessionIds)) {
+          document.global.archivedSessionIds = document.global.archivedSessionIds.filter((entry) => entry !== id)
+        }
+        await writeFile(workspaceFile, JSON.stringify(document, null, 2), 'utf8')
+      },
     }],
     archiveSession: async (id, options) => { registryCalls.push(`archive:${id}:stopActivity=${String(options?.stopActivity === true)}`) },
     unarchiveSession: async (id) => { registryCalls.push(`unarchive:${id}`) },
@@ -562,6 +588,26 @@ async function main() {
 
   const wrongMethod = await call('/dsh-session-delete/delete', { method: 'GET' })
   check(wrongMethod.record.status === 405, 'wrong method answered 405', `HTTP ${wrongMethod.record.status}`)
+
+  // A row whose log is already gone: there is nothing to recycle, but the
+  // registry still lists it, so it must remain removable. This is the state an
+  // earlier design could produce, and it was un-fixable from the UI.
+  registryCalls.length = 0
+  recycledPaths.length = 0
+  const zombie = await call('/dsh-session-delete/delete', { method: 'POST', body: { sessionId: zombieId }, headers: sameOrigin })
+  check(zombie.record.status === 200 && zombie.json()?.removedOnly === true, 'a row with no log is removed, not refused', JSON.stringify(zombie.json()))
+  check(recycledPaths.length === 0, 'nothing is handed to the recycler for a row with no log')
+  check(registryCalls.includes(`detach:${zombieId}`), 'the row with no log is detached', registryCalls.join(' '))
+  check(registryCalls.includes(`unarchive:${zombieId}`), 'its archive entry is cleared too', registryCalls.join(' '))
+  check(registryCalls.some((entry) => entry.startsWith('archive:')) === false, 'a row with no log is never archived for stopping')
+
+  // Neither on disk nor in the registry: that, and only that, is not-found.
+  const nowhere = await call('/dsh-session-delete/delete', {
+    method: 'POST',
+    body: { sessionId: 'session-00000000-0000-4000-8000-0000000000ee' },
+    headers: sameOrigin,
+  })
+  check(nowhere.record.status === 404, 'an id that is nowhere at all is not-found', `HTTP ${nowhere.record.status}`)
 
   // A refused recycle leaves EVERYTHING as it was: the log in place, the archive
   // from the stop step undone, and nothing detached. That is the difference
