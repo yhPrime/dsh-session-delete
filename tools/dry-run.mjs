@@ -298,6 +298,11 @@ async function main() {
       JSON.stringify(client.inject),
     )
 
+    // The dialog's end-state button is wired to a page reload. Rendering the
+    // dialog needs hooks this lane does not fake, so the wiring is asserted at
+    // the source level — enough to catch its accidental removal.
+    check(clientSource.indexOf('location.reload') !== -1, 'the acknowledgement is wired to a page reload')
+
     const ctx = {
       effect: (callback) => ({ dispose: callback() }),
       locale: {
@@ -399,12 +404,13 @@ async function main() {
       if (internal !== undefined && typeof internal.deleteSessionFlow === 'function') {
         const drive = async (answer) => {
           rpcCalls.length = 0
-          const ui = { busy: [], error: [], done: [] }
+          const ui = { busy: [], error: [], done: [], live: [] }
           responder = (call) => answer(call)
           await internal.deleteSessionFlow('session-abc', {
             busy: (value) => ui.busy.push(value),
             error: (value) => { if (value !== null) ui.error.push(value) },
             done: (value) => { if (value !== null) ui.done.push(value) },
+            live: (value) => ui.live.push(value),
           })
           return ui
         }
@@ -424,11 +430,13 @@ async function main() {
 
         const wasLive = await drive(answer(200, '{"ok":true,"wasLive":true,"notes":[]}'))
         check(
-          wasLive.done.length === 1 && String(wasLive.done[0]).indexOf('restart') !== -1,
-          'a Session this run had loaded is told its row may linger until a restart',
+          wasLive.done.length === 1 && String(wasLive.done[0]).indexOf('reload') !== -1,
+          'a Session this run had loaded is told its row may linger, and that a reload is the way out',
           String(wasLive.done[0]),
         )
         check(wasLive.done[0] !== happy.done[0], 'the live case does not reuse the plain success text')
+        check(wasLive.live.length === 1 && wasLive.live[0] === true, 'the flow tells the UI a row is expected to linger')
+        check(happy.live.length === 0, 'the plain path reports no lingering row')
 
         const partial = await drive(answer(200, '{"ok":true,"notes":["detach failed: boom"]}'))
         check(partial.error.length === 1, 'a registry note the Host calls a failure is surfaced', partial.error.join(' | '))
