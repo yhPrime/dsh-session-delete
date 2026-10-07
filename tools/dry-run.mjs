@@ -304,10 +304,10 @@ async function main() {
     // Rendering the dialog needs hooks this lane does not fake, so the wiring is
     // asserted at the source level, which is enough to catch its return.
     check(clientSource.indexOf('location.reload') === -1, 'the acknowledgement does not reload the page')
-    check(clientSource.indexOf('liveNotice') !== -1, 'a lingering row is announced as a notice')
-    // The notice occupies the box the "delete" button vacated rather than a
+    check(clientSource.indexOf('afterRestart') !== -1, 'the merged success box says the Session leaves on restart')
+    // The result occupies the box the "delete" button vacated rather than a
     // footnote below it, so the dialog keeps its shape.
-    check(clientSource.indexOf('dsd-resolution') !== -1, 'the notice fills the box the button vacated')
+    check(clientSource.indexOf('dsd-resolution') !== -1, 'the result fills the box the button vacated')
 
     const ctx = {
       effect: (callback) => ({ dispose: callback() }),
@@ -410,13 +410,12 @@ async function main() {
       if (internal !== undefined && typeof internal.deleteSessionFlow === 'function') {
         const drive = async (answer) => {
           rpcCalls.length = 0
-          const ui = { busy: [], error: [], done: [], live: [] }
+          const ui = { busy: [], error: [], done: [] }
           responder = (call) => answer(call)
           await internal.deleteSessionFlow('session-abc', {
             busy: (value) => ui.busy.push(value),
             error: (value) => { if (value !== null) ui.error.push(value) },
             done: (value) => { if (value !== null) ui.done.push(value) },
-            live: (value) => ui.live.push(value),
           })
           return ui
         }
@@ -435,10 +434,9 @@ async function main() {
         )
 
         const wasLive = await drive(answer(200, '{"ok":true,"wasLive":true,"notes":[]}'))
-        check(wasLive.done.length === 1, 'the live case still reports success')
-        check(wasLive.done[0] === happy.done[0], 'the success text is the same; only the notice differs')
-        check(wasLive.live.length === 1 && wasLive.live[0] === true, 'the flow tells the UI a row will linger')
-        check(happy.live.length === 0, 'the plain path reports no lingering row')
+        check(wasLive.done.length === 1, 'a Session that was loaded still reports success')
+        check(wasLive.done[0] === happy.done[0], 'liveness does not branch the message — the success state is merged')
+        check(happy.done.length === 1 && happy.error.length === 0, 'the plain path is the same merged state')
 
         const partial = await drive(answer(200, '{"ok":true,"notes":["detach failed: boom"]}'))
         check(partial.error.length === 1, 'a registry note the Host calls a failure is surfaced', partial.error.join(' | '))
