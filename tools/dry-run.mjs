@@ -422,6 +422,14 @@ async function main() {
           'a row with no log left is removed, and reported as such',
         )
 
+        const wasLive = await drive(answer(200, '{"ok":true,"wasLive":true,"notes":[]}'))
+        check(
+          wasLive.done.length === 1 && String(wasLive.done[0]).indexOf('restart') !== -1,
+          'a Session this run had loaded is told its row may linger until a restart',
+          String(wasLive.done[0]),
+        )
+        check(wasLive.done[0] !== happy.done[0], 'the live case does not reuse the plain success text')
+
         const partial = await drive(answer(200, '{"ok":true,"notes":["detach failed: boom"]}'))
         check(partial.error.length === 1, 'a registry note the Host calls a failure is surfaced', partial.error.join(' | '))
 
@@ -516,6 +524,10 @@ async function main() {
   }, null, 2), 'utf8')
 
   const registryCalls = []
+  // Which Sessions the running process has loaded. A live Session can only be
+  // un-loaded by its owner, so it is what leaves a lingering row behind.
+  const liveSessions = new Set()
+  const sessionsStore = { get: (id) => (liveSessions.has(id) ? { id } : undefined) }
   const registry = {
     list: () => [{
       id: 'ws-1',
@@ -549,7 +561,7 @@ async function main() {
           return () => {}
         },
       },
-      get: (name) => (name === 'workspaceRegistry' ? registry : undefined),
+      get: (name) => (name === 'workspaceRegistry' ? registry : name === 'sessions' ? sessionsStore : undefined),
     }, { recycle })
     return table
   }
@@ -600,6 +612,7 @@ async function main() {
   check(registryCalls.includes(`detach:${zombieId}`), 'the row with no log is detached', registryCalls.join(' '))
   check(registryCalls.includes(`unarchive:${zombieId}`), 'its archive entry is cleared too', registryCalls.join(' '))
   check(registryCalls.some((entry) => entry.startsWith('archive:')) === false, 'a row with no log is never archived for stopping')
+  check(zombie.json()?.wasLive === false, 'a Session this process never loaded is not reported as live')
 
   // Neither on disk nor in the registry: that, and only that, is not-found.
   const nowhere = await call('/dsh-session-delete/delete', {
@@ -624,9 +637,13 @@ async function main() {
 
   registryCalls.length = 0
   recycledPaths.length = 0
+  // Loaded in this process — the case that leaves a row behind, and the one the
+  // answer has to admit.
+  liveSessions.add(sessionId)
   for (const [path, handler] of mountWith(fakeRecycle)) routes.set(path, handler)
   const deleted = await call('/dsh-session-delete/delete', { method: 'POST', body: { sessionId }, headers: sameOrigin })
   check(deleted.record.status === 200 && deleted.json()?.ok === true, 'delete succeeds', JSON.stringify(deleted.json()))
+  check(deleted.json()?.wasLive === true, 'a Session loaded in this process is reported as live — the honest half of the lingering row', JSON.stringify(deleted.json()?.wasLive))
   check(existsSync(sessionDir) === false, 'the log directory left its old home')
   check(existsSync(projcache) === false, 'the projection cache left its old home')
   check(existsSync(keepDir) === true, 'an unrelated session is untouched')
