@@ -223,6 +223,12 @@ async function main() {
   const localeWrites = []
   const loaderEntries = {}
 
+  // HTTP seam: the client half reaches its Host half with fetch, so recording
+  // those calls is how the ordered trash flow gets asserted. `responder` is
+  // swapped per case.
+  const rpcCalls = []
+  let responder = () => ({ status: 200, body: '{}' })
+
   const sandbox = {
     window: { __ModuleLoader__: { load: (spec) => { loaderEntries[spec.id] = spec } } },
     document: {
@@ -233,6 +239,16 @@ async function main() {
     },
     styles: { insert: (css) => { insertedCss.push(css); return () => {} } },
     console: { log() {}, warn() {}, error() {} },
+    fetch: async (url, init) => {
+      const call = { url, method: init?.method, body: init?.body }
+      rpcCalls.push(call)
+      const answer = responder(call) ?? { status: 200, body: '{}' }
+      return {
+        ok: answer.status >= 200 && answer.status < 300,
+        status: answer.status,
+        async text() { return answer.body ?? '' },
+      }
+    },
   }
   vm.createContext(sandbox)
   try {
@@ -327,15 +343,20 @@ async function main() {
         throw new Error(`unexpected require: ${specifier}`)
       })
       const officialRegistrations = []
-      official.apply({
+      const officialArchived = []
+      const officialCtx = {
         effect: (callback) => ({ dispose: callback() }),
         locale: { register: () => () => {}, bind: () => (key) => key, getSnapshot: () => ({ active: 'en' }) },
         slots: {
           inject: (slot, callback) => { callback(); return () => {} },
           register: (meta, component) => { officialRegistrations.push({ meta, component }); return () => {} },
         },
-        workspaces: { archiveSession: async () => {}, unarchiveSession: async () => {} },
-      })
+        workspaces: {
+          archiveSession: async (id) => { officialArchived.push(id) },
+          unarchiveSession: async () => {},
+        },
+      }
+      official.apply(officialCtx)
       const officialMenu = officialRegistrations.find(({ meta }) => meta.name === 'sidebar.workspaces.session.menu.item')
       check(officialMenu !== undefined, 'primitives path: menu row registered')
       if (officialMenu !== undefined) {
@@ -354,6 +375,51 @@ async function main() {
         check(row.props.icon?.props?.size === 14, 'trash icon drawn at the shipped 14px', String(row.props.icon?.props?.size))
         row.props.onSelect()
         check(menuCloses.length === 1 && menuCloses[0] === false, 'selecting the row dismisses the menu')
+      }
+
+      // The ordered trash flow, driven through the module's test seam: it takes
+      // its UI callbacks as plain functions, so the sequence is assertable
+      // without a React renderer — the only way to test it offline at all.
+      const internal = official.__internal
+      check(internal !== undefined && typeof internal.trashWhileVisible === 'function', 'client exposes the trash flow as a test seam')
+      if (internal !== undefined && typeof internal.trashWhileVisible === 'function') {
+        const drive = async (answer) => {
+          rpcCalls.length = 0
+          officialArchived.length = 0
+          const ui = { busy: [], error: [], done: [] }
+          responder = (call) => answer(call)
+          await internal.trashWhileVisible('session-abc', {
+            busy: (value) => ui.busy.push(value),
+            error: (value) => { if (value !== null) ui.error.push(value) },
+            done: (value) => { if (value !== null) ui.done.push(value) },
+          })
+          return ui
+        }
+        const paths = () => rpcCalls.map((call) => call.url).join(' ')
+        const probe = (status) => (call) => (call.url.endsWith('/trash/locate')
+          ? { status, body: status === 404 ? '{"ok":false,"reason":"not-found"}' : '{}' }
+          : { status: 200, body: '{"ok":true,"entry":"2026-01-01T00-00-00-000Z--session-abc"}' })
+
+        const happy = await drive(probe(200))
+        check(
+          paths() === '/dsh-session-delete/trash/locate /dsh-session-delete/trash',
+          'the flow probes the Host before it moves anything',
+          paths(),
+        )
+        check(officialArchived.join(' ') === 'session-abc', 'the flow archives the Session', officialArchived.join(' '))
+        check(happy.done.length === 1 && happy.error.length === 0, 'the happy path reports success')
+        check(JSON.parse(rpcCalls[1].body).sessionId === 'session-abc', 'the move carries the session id')
+
+        const missing = await drive(probe(404))
+        check(officialArchived.length === 0, 'a Session the Host cannot find is NOT archived — the dead end 1.1.0 shipped')
+        check(rpcCalls.length === 1, 'a missing Session stops right after the probe', String(rpcCalls.length))
+        check(missing.error.length === 1 && missing.done.length === 0, 'a missing Session says why, and stays listed')
+
+        const oldHost = await drive((call) => (call.url.endsWith('/trash/locate')
+          ? { status: 405, body: '' }
+          : { status: 404, body: '{"ok":false,"reason":"not-found"}' }))
+        check(officialArchived.join(' ') === 'session-abc', 'a Host without the locator still archives — never worse than before')
+        check(oldHost.error.length === 1, 'a Host without the locator reports the move failure')
       }
     }
   }
