@@ -35,7 +35,13 @@
  * 7. Isolation        — the real home is untouched, and uninstalling the staged
  *    copy leaves no residue.
  *
- * Usage: node tools/dry-run.mjs [--scratch <dir>] [--composition <cordis.yml>] [--keep]
+ * Usage: node tools/dry-run.mjs [--scratch <dir>] [--composition <module-list>] [--keep]
+ *
+ * `--composition` wants a LIVE module list — a `plugin_manager list_bundles`
+ * dump, whose rows carry `moduleName:`. The profile's cordis.yml is the empty
+ * root on current hosts ("the tree is composed as patches"), so pointing at it
+ * makes step 3 skip rather than fail. The authoritative form of that check is
+ * live: the slot occupant list shows whether the gate actually let the entry in.
  */
 
 import { cp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
@@ -121,6 +127,11 @@ async function main() {
   }
 
   const realTrashBefore = existsSync(join(realHome, 'trash', NAME))
+  // Snapshot rather than assume: this plugin IS installed on some machines, so
+  // the isolation property is "the run changed nothing", not "the profile does
+  // not mention it".
+  const realProfilePath = join(realHome, 'profiles', 'desktop', 'package.json')
+  const realProfileBefore = existsSync(realProfilePath) ? await readFile(realProfilePath, 'utf8') : null
   await rm(scratch, { recursive: true, force: true })
   await mkdir(scratch, { recursive: true })
 
@@ -176,9 +187,21 @@ async function main() {
   check(Array.isArray(declared) && declared.length > 0, 'inject list is declared', declared.join(', '))
   if (existsSync(compositionPath)) {
     const composition = await readFile(compositionPath, 'utf8')
-    const names = new Set([...composition.matchAll(/name:\s*'([^']+)'/g)].map((match) => match[1]))
+    // Accepts a loader entry list (`name:` rows) or a `plugin_manager
+    // list_bundles` dump (`moduleName:` rows), quoted either way. The profile's
+    // own cordis.yml is the EMPTY root on current hosts — its header says "the
+    // tree is composed as patches" — so it is only usable input when something
+    // expanded it. An empty file is a SKIP, not a pass: the authoritative check
+    // is live (a list_bundles dump, or the slot occupant list).
+    const names = new Set(
+      [...composition.matchAll(/(?:moduleName|name):\s*['"]?([A-Za-z0-9@/._-]+)['"]?/g)].map((match) => match[1]),
+    )
     console.log(`       composition: ${compositionPath} (${names.size} rows)`)
-    for (const seam of declared) check(names.has(seam), `seam present in the composition: ${seam}`)
+    if (names.size === 0) {
+      pass('composition gate skipped — supplied file lists no modules (pass a live list_bundles dump)')
+    } else {
+      for (const seam of declared) check(names.has(seam), `seam present in the composition: ${seam}`)
+    }
   } else {
     fail('composition readable', compositionPath)
   }
@@ -289,6 +312,49 @@ async function main() {
       const flat = JSON.stringify(withId)
       check(flat.includes('menuitem'), 'menu row renders a role="menuitem" button')
       check(flat.includes('session-abc') === false, 'menu row keeps the session id out of markup')
+
+      // The official-primitive path, through a SECOND factory instance whose
+      // require table carries ui-primitives. This is the regression test for the
+      // bug 1.1.0 shipped: the row rendered and never fired, because
+      // MenuItemButton's activation prop is `onSelect`, not `onClick`.
+      const primitivesStub = {
+        MenuItemButton: (props) => ({ type: 'MenuItemButton', props: props ?? {}, children: props?.children ?? [] }),
+        IconTrashOutlineRegular: (props) => ({ type: 'IconTrashOutlineRegular', props: props ?? {}, children: [] }),
+      }
+      const official = entry.factory((specifier) => {
+        if (specifier === 'react') return reactShim
+        if (specifier === '@deepseek-ai/dsh-client-ui-primitives') return primitivesStub
+        throw new Error(`unexpected require: ${specifier}`)
+      })
+      const officialRegistrations = []
+      official.apply({
+        effect: (callback) => ({ dispose: callback() }),
+        locale: { register: () => () => {}, bind: () => (key) => key, getSnapshot: () => ({ active: 'en' }) },
+        slots: {
+          inject: (slot, callback) => { callback(); return () => {} },
+          register: (meta, component) => { officialRegistrations.push({ meta, component }); return () => {} },
+        },
+        workspaces: { archiveSession: async () => {}, unarchiveSession: async () => {} },
+      })
+      const officialMenu = officialRegistrations.find(({ meta }) => meta.name === 'sidebar.workspaces.session.menu.item')
+      check(officialMenu !== undefined, 'primitives path: menu row registered')
+      if (officialMenu !== undefined) {
+        const menuCloses = []
+        const row = officialMenu.component({
+          t: (key) => key,
+          sessionId: 'session-abc',
+          displayTitle: '题目',
+          useMenuOpenState: () => [true, (open) => { menuCloses.push(open) }],
+        })
+        check(row.type === primitivesStub.MenuItemButton, 'menu row renders through the official MenuItemButton')
+        check(row.props.onClick === undefined, 'menu row does NOT pass onClick (the primitive takes onSelect)')
+        check(typeof row.props.onSelect === 'function', 'menu row passes onSelect as a function')
+        check(row.props.separatorBefore === true, 'menu row asks for a group hairline')
+        check(row.props.icon?.type === primitivesStub.IconTrashOutlineRegular, 'menu row uses the official trash icon')
+        check(row.props.icon?.props?.size === 14, 'trash icon drawn at the shipped 14px', String(row.props.icon?.props?.size))
+        row.props.onSelect()
+        check(menuCloses.length === 1 && menuCloses[0] === false, 'selecting the row dismisses the menu')
+      }
     }
   }
 
@@ -417,13 +483,8 @@ async function main() {
   console.log('\n[7] isolation and uninstall')
   check(resolve(process.env.DSH_HOME) === home, 'the run used the scratch home')
   check(existsSync(join(realHome, 'trash', NAME)) === realTrashBefore, 'the real trash directory was not created')
-  const realProfile = join(realHome, 'profiles', 'desktop', 'package.json')
-  if (existsSync(realProfile)) {
-    const text = await readFile(realProfile, 'utf8')
-    check(text.includes(NAME) === false, 'the real desktop profile does not mention this package')
-  } else {
-    check(true, 'no real desktop profile to check', realProfile)
-  }
+  const realProfileAfter = existsSync(realProfilePath) ? await readFile(realProfilePath, 'utf8') : null
+  check(realProfileAfter === realProfileBefore, 'the real desktop profile manifest is untouched by the run')
 
   await rm(installed, { recursive: true, force: true })
   check(existsSync(installed) === false, 'uninstalling the staged copy removes it cleanly')
