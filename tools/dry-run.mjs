@@ -361,12 +361,18 @@ async function main() {
   /* ----------------------------- 6. host half ----------------------------- */
   console.log('\n[6] host half against a fake Harness home')
   const home = join(scratch, 'home')
-  const sessionId = '921ab38a-21e8-461f-96d0-4d330d70e4e9'
-  const keepId = '8ecc5c85-a8e4-4739-9282-3e574446207e'
+  // The canonical SessionId carries the `session-` prefix — that is the shape
+  // workspace.json stores and the shape the slot hands the client — and the
+  // directory name IS that string. The fixtures use the canonical form on
+  // purpose, so a double-prefixed lookup cannot pass by accident; the bare uuid
+  // is kept as the second accepted spelling.
+  const sessionId = 'session-921ab38a-21e8-461f-96d0-4d330d70e4e9'
+  const bareSessionId = '921ab38a-21e8-461f-96d0-4d330d70e4e9'
+  const keepId = 'session-8ecc5c85-a8e4-4739-9282-3e574446207e'
   const project = '--E-workDeepSeek-demo--'
-  const sessionDir = join(home, 'sessions', project, `session-${sessionId}`)
-  const keepDir = join(home, 'sessions', project, `session-${keepId}`)
-  const projcache = join(home, 'storages', 'session_projcache', 'sessions', `session-${sessionId}.json`)
+  const sessionDir = join(home, 'sessions', project, sessionId)
+  const keepDir = join(home, 'sessions', project, keepId)
+  const projcache = join(home, 'storages', 'session_projcache', 'sessions', `${sessionId}.json`)
   await mkdir(sessionDir, { recursive: true })
   await mkdir(keepDir, { recursive: true })
   await mkdir(dirname(projcache), { recursive: true })
@@ -396,7 +402,7 @@ async function main() {
     fail('host half mounts', String(error?.message ?? error))
   }
   check(effects === 1, 'routes mount inside a ctx.effect (unloadable)')
-  for (const path of ['/dsh-session-delete/trash', '/dsh-session-delete/trash/restore', '/dsh-session-delete/trash/purge']) {
+  for (const path of ['/dsh-session-delete/trash', '/dsh-session-delete/trash/locate', '/dsh-session-delete/trash/restore', '/dsh-session-delete/trash/purge']) {
     check(routes.has(path), `${path} registered`)
   }
 
@@ -408,6 +414,17 @@ async function main() {
     return response
   }
   const sameOrigin = { origin: 'http://127.0.0.1:19387' }
+
+  // The read-only locator proves an install can SEE a Session without moving
+  // it — the one failure the UI cannot explain by itself, and the regression
+  // test for the double-`session-` lookup the first release shipped.
+  const located = await call('/dsh-session-delete/trash/locate', { method: 'POST', body: { sessionId }, headers: sameOrigin })
+  check(located.record.status === 200 && located.json()?.dir === sessionDir, 'locate finds the canonical session id', JSON.stringify(located.json()))
+  const locatedBare = await call('/dsh-session-delete/trash/locate', { method: 'POST', body: { sessionId: bareSessionId }, headers: sameOrigin })
+  check(locatedBare.record.status === 200 && locatedBare.json()?.dir === sessionDir, 'locate accepts a bare uuid for the same Session')
+  const locatedMissing = await call('/dsh-session-delete/trash/locate', { method: 'POST', body: { sessionId: 'session-00000000-0000-4000-8000-000000000000' }, headers: sameOrigin })
+  check(locatedMissing.record.status === 404, 'locate reports a Session it cannot find', `HTTP ${locatedMissing.record.status}`)
+  check(existsSync(join(sessionDir, 'session.v4.jsonl.zstd')), 'locate moves nothing')
 
   const empty = await call('/dsh-session-delete/trash')
   check(
@@ -434,7 +451,7 @@ async function main() {
   check(existsSync(projcache) === false, 'projection cache left its old home')
   check(existsSync(keepDir) === true, 'an unrelated session is untouched')
   const entryDir = join(home, 'trash', NAME, entryName)
-  check(existsSync(join(entryDir, `session-${sessionId}`, 'session.v4.jsonl.zstd')), 'payload sits inside the trash entry')
+  check(existsSync(join(entryDir, sessionId, 'session.v4.jsonl.zstd')), 'payload sits inside the trash entry')
   check(existsSync(join(entryDir, 'session_projcache.json')), 'projection cache travelled with it')
   check(existsSync(join(entryDir, 'trash.json')), 'entry records where it came from')
   const meta = JSON.parse(await readFile(join(entryDir, 'trash.json'), 'utf8'))
