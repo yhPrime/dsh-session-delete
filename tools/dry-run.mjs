@@ -305,6 +305,9 @@ async function main() {
     // asserted at the source level, which is enough to catch its return.
     check(clientSource.indexOf('location.reload') === -1, 'the acknowledgement does not reload the page')
     check(clientSource.indexOf('liveNotice') !== -1, 'a lingering row is announced as a notice')
+    // The notice occupies the box the "delete" button vacated rather than a
+    // footnote below it, so the dialog keeps its shape.
+    check(clientSource.indexOf('dsd-resolution') !== -1, 'the notice fills the box the button vacated')
 
     const ctx = {
       effect: (callback) => ({ dispose: callback() }),
